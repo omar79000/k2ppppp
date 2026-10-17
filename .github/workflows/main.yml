@@ -1,1 +1,39 @@
 
+name: Analyze K2P Firmware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binwalk squashfs-tools file xz-utils
+
+      - name: Find and inspect firmware
+        run: |
+          set -eu
+          mkdir -p report
+          find . -type f -name '*.bin' -print
+          FW="$(find . -type f -name '*.bin' \
+            ! -path './report/*' | head -n 1)"
+          test -n "$FW"
+          echo "Firmware: $FW"
+          sha256sum "$FW" | tee report/sha256.txt
+          file "$FW" | tee report/file-type.txt
+          binwalk "$FW" | tee report/binwalk.txt
+
+      - name: Save inspection report
+        uses: actions/upload-artifact@v4
+        with:
+          name: K2P-firmware-analysis
+          path: report/
