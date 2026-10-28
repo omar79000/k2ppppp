@@ -1,7 +1,467 @@
 name: K2P Firmware Complete Analysis
 
 on:
+name: K2P Firmware Complete Analysis
+
+on:
 workflow_dispatch:
+push:
+paths:
+- "*.bin"
+- ".github/workflows/main.yml"
+
+permissions:
+contents: read
+
+jobs:
+firmware-analysis:
+name: Analyze and Extract Firmware
+runs-on: ubuntu-22.04
+timeout-minutes: 45
+
+steps:
+  - name: Checkout Repository
+    uses: actions/checkout@v4
+
+  - name: Install Analysis Tools
+    shell: bash
+    run: |
+      set -e
+      sudo apt-get update
+      sudo apt-get install -y \
+        binwalk \
+        squashfs-tools \
+        file \
+        binutils \
+        xxd \
+        device-tree-compiler \
+        u-boot-tools \
+        python3 \
+        jq \
+        unzip \
+        p7zip-full
+
+  - name: Locate Firmware
+    id: firmware
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      mkdir -p work reports output
+
+      mapfile -d '' files < <(
+        find . -maxdepth 2 -type f -name '*.bin' \
+          -not -path './.git/*' \
+          -not -path './output/*' \
+          -print0
+      )
+
+      if [ "${#files[@]}" -ne 1 ]; then
+        echo "::error::Expected exactly one firmware BIN file."
+        echo "Found ${#files[@]} BIN files:"
+        printf '%s\n' "${files[@]}"
+        exit 1
+      fi
+
+      echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+      echo "Firmware selected: ${files[0]}"
+
+  - name: Identify Firmware
+    shell: bash
+    env:
+      FW: ${{ steps.firmware.outputs.path }}
+    run: |
+      set -euo pipefail
+
+      {
+        echo "K2P FIRMWARE IDENTITY REPORT"
+        echo "============================"
+        echo "File: $FW"
+        echo
+
+        echo "===== FILE INFORMATION ====="
+        stat "$FW"
+        echo
+
+        echo "===== SHA256 ====="
+        sha256sum "$FW"
+        echo
+
+        echo "===== FILE TYPE ====="
+        file "$FW"
+        echo
+
+        echo "===== FIRST 512 BYTES ====="
+        xxd -l 512 "$FW"
+        echo
+
+        echo "===== FIRMWARE SIGNATURES ====="
+        binwalk "$FW" || true
+        echo
+
+        echo "===== IMPORTANT STRINGS ====="
+        strings -a -n 8 "$FW" > /tmp/k2p-all-strings.txt || true
+
+        grep -Ei \
+          'OpenWrt|ImmortalWrt|Linux version|MIPS|MT7620|MT7621|K2P|machine|board|compatible|model|Squashfs|uImage|rootfs|firmware version|DISTRIB_' \
+          /tmp/k2p-all-strings.txt \
+          > /tmp/k2p-filtered-strings.txt || true
+
+        head -n 1500 /tmp/k2p-filtered-strings.txt || true
+
+      } > reports/01-firmware-identity.txt 2>&1
+
+  - name: Scan Embedded Components
+    shell: bash
+    env:
+      FW: ${{ steps.firmware.outputs.path }}
+    run: |
+      mkdir -p output/binwalk reports
+
+      {
+        echo "Recursive firmware scan"
+        echo "Firmware: $FW"
+        echo
+
+        binwalk -eM -C output/binwalk "$FW" || true
+
+        echo
+        echo "Scan completed. Review the output for extraction errors."
+      } > reports/02-binwalk-extraction.txt 2>&1
+
+  - name: Extract Root Filesystem
+    shell: bash
+    env:
+      FW: ${{ steps.firmware.outputs.path }}
+    run: |
+      set -u
+
+      mkdir -p output/rootfs reports
+
+      binwalk "$FW" > /tmp/k2p-binwalk.txt 2>&1 || true
+
+      OFFSET="$(
+        awk 'tolower($0) ~ /squashfs filesystem/ {print $1; exit}' \
+          /tmp/k2p-binwalk.txt
+      )"
+
+      if [[ ! "$OFFSET" =~ ^[0-9]+$ ]]; then
+        {
+          echo "No SquashFS filesystem detected."
+          echo "Review reports/01-firmware-identity.txt"
+          echo "and reports/02-binwalk-extraction.txt"
+        } > reports/03-rootfs-extraction.txt
+        exit 0
+      fi
+
+      echo "SquashFS offset: $OFFSET" \
+        > reports/03-rootfs-extraction.txt
+
+      if ! dd if="$FW" of=output/rootfs.squashfs \
+        bs=1 skip="$OFFSET" status=none; then
+        echo "Failed to extract the SquashFS data." \
+          >> reports/03-rootfs-extraction.txt
+        exit 0
+      fi
+
+      if unsquashfs -s output/rootfs.squashfs \
+        >> reports/03-rootfs-extraction.txt 2>&1; then
+
+        unsquashfs -no-progress \
+          -d output/rootfs \
+          output/rootfs.squashfs \
+          >> reports/03-rootfs-extraction.txt 2>&1 \
+          || echo "Root filesystem extraction failed." \
+            >> reports/03-rootfs-extraction.txt
+
+      else
+        echo "SquashFS validation failed." \
+          >> reports/03-rootfs-extraction.txt
+      fi
+
+      echo "===== EXTRACTED FILE COUNT =====" \
+        >> reports/03-rootfs-extraction.txt
+
+      find output/rootfs -type f 2>/dev/null | wc -l \
+        >> reports/03-rootfs-extraction.txt
+
+      echo "===== EXTRACTED DIRECTORY SIZE =====" \
+        >> reports/03-rootfs-extraction.txt
+
+      du -sh output/rootfs \
+        >> reports/03-rootfs-extraction.txt 2>&1 || true
+
+  - name: Analyze Operating System
+    shell: bash
+    run: |
+      set -u
+
+      ROOT="output/rootfs"
+      REPORT="reports/04-operating-system.txt"
+
+      mkdir -p reports
+
+      {
+        echo "===== DISTRIBUTION INFORMATION ====="
+
+        for f in \
+          "$ROOT/etc/openwrt_release" \
+          "$ROOT/etc/openwrt_version" \
+          "$ROOT/etc/os-release" \
+          "$ROOT/etc/immortalwrt_release" \
+          "$ROOT/etc/banner"; do
+
+          if [ -f "$f" ]; then
+            echo
+            echo "===== $f ====="
+            cat "$f"
+          fi
+        done
+
+        echo
+        echo "===== BUILD AND BOARD FILES ====="
+
+        for d in "$ROOT/etc" "$ROOT/lib"; do
+          if [ -d "$d" ]; then
+            find "$d" -maxdepth 4 -type f \
+              \( \
+                -iname '*release*' -o \
+                -iname '*version*' -o \
+                -iname '*board*' -o \
+                -iname '*model*' \
+              \) -print 2>/dev/null || true
+          fi
+        done
+
+        echo
+        echo "===== KERNEL MODULES ====="
+
+        find "$ROOT" -type f \
+          \( -name '*.ko' -o -name '*.ko.*' \) \
+          -print 2>/dev/null | sort || true
+
+        echo
+        echo "===== DEVICE TREE FILES ====="
+
+        find output -type f \
+          \( -name '*.dtb' -o -name '*.dtbo' \) \
+          -print 2>/dev/null | sort || true
+
+      } > "$REPORT" 2>&1
+
+      while IFS= read -r -d '' dtb; do
+        name="$(basename "$dtb")"
+
+        {
+          echo "===== DEVICE TREE: $name ====="
+          file "$dtb"
+          echo
+          dtc -I dtb -O dts "$dtb" 2>&1 || true
+        } > "reports/dtb-${name}.txt"
+
+      done < <(
+        find output -type f \
+          \( -name '*.dtb' -o -name '*.dtbo' \) \
+          -print0
+      )
+
+  - name: Inventory Files and Packages
+    shell: bash
+    run: |
+      set -u
+
+      ROOT="output/rootfs"
+      mkdir -p reports
+
+      echo "===== COMPLETE FILE INVENTORY =====" \
+        > reports/05-complete-file-inventory.txt
+
+      find "$ROOT" -printf '%y %m %u:%g %p\n' \
+        2>/dev/null | sort \
+        >> reports/05-complete-file-inventory.txt || true
+
+      find "$ROOT" -type f -print0 2>/dev/null |
+      while IFS= read -r -d '' f; do
+        case "$f" in
+          */usr/lib/opkg/status|\
+          */usr/lib/opkg/info/*.control|\
+          */usr/lib/apk/db/installed|\
+          */lib/apk/db/installed)
+
+            echo "===== $f ====="
+            cat "$f" 2>/dev/null || true
+            echo
+            ;;
+        esac
+      done > reports/06-package-information.txt
+
+      find "$ROOT" -type f -perm /111 \
+        -print 2>/dev/null | sort \
+        > reports/07-executable-files.txt || true
+
+      find "$ROOT" -type f \
+        \( -name '*.so' -o -name '*.so.*' \) \
+        -print 2>/dev/null | sort \
+        > reports/08-shared-libraries.txt || true
+
+      find "$ROOT" -type f \
+        \( -name '*.sh' -o -name 'rc.common' \) \
+        -print 2>/dev/null | sort \
+        > reports/09-shell-scripts.txt || true
+
+  - name: Analyze Network Configuration
+    shell: bash
+    run: |
+      set -u
+
+      ROOT="output/rootfs"
+      REPORT="reports/10-system-configuration.txt"
+
+      mkdir -p reports
+
+      {
+        echo "===== CONFIGURATION FILE PATHS ====="
+
+        for d in \
+          "$ROOT/etc/config" \
+          "$ROOT/etc/init.d" \
+          "$ROOT/etc/uci-defaults" \
+          "$ROOT/etc/hotplug.d" \
+          "$ROOT/lib/upgrade" \
+          "$ROOT/lib/preinit" \
+          "$ROOT/usr/libexec"; do
+
+          if [ -d "$d" ]; then
+            echo
+            echo "===== $d ====="
+            find "$d" -maxdepth 4 -type f \
+              -print 2>/dev/null | sort || true
+          fi
+        done
+
+        echo
+        echo "===== NETWORK-RELATED COMPONENTS ====="
+
+        find "$ROOT" -type f \
+          \( \
+            -iname '*wireless*' -o \
+            -iname '*hostapd*' -o \
+            -iname '*firewall*' -o \
+            -iname '*network*' -o \
+            -iname '*dnsmasq*' -o \
+            -iname '*sysupgrade*' \
+          \) -print 2>/dev/null | sort || true
+
+      } > "$REPORT" 2>&1
+
+  - name: Assess Rebuild Readiness
+    shell: bash
+    env:
+      FW: ${{ steps.firmware.outputs.path }}
+    run: |
+      set -u
+
+      REPORT="reports/11-rebuild-readiness.txt"
+      ROOT="output/rootfs"
+
+      mkdir -p reports
+
+      {
+        echo "===== REBUILD READINESS REPORT ====="
+        echo "Original firmware: $FW"
+        echo
+
+        echo "===== SHA256 ====="
+        sha256sum "$FW"
+        echo
+
+        echo "===== ROOT FILESYSTEM STATUS ====="
+
+        if [ -d "$ROOT" ] &&
+          [ -n "$(find "$ROOT" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+          echo "Root filesystem directory contains files."
+        else
+          echo "Root filesystem unavailable or empty."
+        fi
+
+        echo
+        echo "===== IMPORTANT UPGRADE FILES ====="
+
+        for f in \
+          "$ROOT/sbin/sysupgrade" \
+          "$ROOT/lib/upgrade/platform.sh" \
+          "$ROOT/etc/board.json" \
+          "$ROOT/etc/board.d/01_leds" \
+          "$ROOT/etc/openwrt_release"; do
+
+          if [ -f "$f" ]; then
+            echo "FOUND: $f"
+          else
+            echo "NOT FOUND: $f"
+          fi
+        done
+
+        echo
+        echo "===== IMPORTANT WARNING ====="
+        echo "This workflow analyzes and extracts firmware."
+        echo "It does not build a verified flashable sysupgrade.bin."
+        echo "A compatible board definition, build configuration,"
+        echo "kernel, device tree, partition layout, and image format"
+        echo "must be verified before attempting to flash modified firmware."
+
+      } > "$REPORT" 2>&1
+
+  - name: Generate Analysis Summary
+    if: always()
+    shell: bash
+    env:
+      FIRMWARE_PATH: ${{ steps.firmware.outputs.path }}
+    run: |
+      mkdir -p reports output
+
+      {
+        echo "# K2P Firmware Analysis"
+        echo
+        echo "Repository: $GITHUB_REPOSITORY"
+        echo "Run number: $GITHUB_RUN_NUMBER"
+        echo
+        echo "## Generated Reports"
+
+        find reports -maxdepth 1 -type f \
+          -printf '%f\n' 2>/dev/null | sort || true
+
+        echo
+        echo "## Extracted Files"
+
+        if [ -d output/rootfs ]; then
+          find output/rootfs -type f 2>/dev/null | wc -l
+        else
+          echo "Root filesystem not extracted."
+        fi
+
+        echo
+        echo "## Original Firmware"
+
+        if [ -n "${FIRMWARE_PATH:-}" ] &&
+          [ -f "$FIRMWARE_PATH" ]; then
+          echo "File: $FIRMWARE_PATH"
+          sha256sum "$FIRMWARE_PATH"
+        else
+          echo "Firmware path unavailable."
+        fi
+
+      } > reports/README-ANALYSIS.md
+
+  - name: Upload Analysis and Extracted Files
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: K2P-Firmware-Analysis-${{ github.run_number }}
+      path: |
+        reports/
+        output/
+      if-no-files-found: warn
+      retention-days: 14:
 push:
 paths:
 - "*.bin"
