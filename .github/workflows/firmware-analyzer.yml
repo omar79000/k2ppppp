@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       firmware_path:
-        description: 'اسم ملف السوفتوير في المستودع (مثال: k2p-sysupgrade.bin)'
+        description: 'اسم ملف السوفتوير في المستودع'
         required: true
-        default: 'firmware.bin'
+        default: 'METATRON-K2P (1)سوفت فايكوم حكيم .bin'
 
 jobs:
   analyze_and_extract:
@@ -76,9 +76,9 @@ jobs:
                                   run_cmd(f"unsquashfs -d {extracted_rootfs}/extracted {sub}")
                   else:
                       print("[*] الملف صورة خام، يتم استخدام Binwalk والتفكيك...")
-                      run_cmd(f"binwalk -e --directory={output_dir} {fw_file}")
+                      run_cmd(f"binwalk -e --directory={output_dir} \"{fw_file}\"")
                       for sqfs in glob.glob(f"{output_dir}/**/*.squashfs", recursive=True) + glob.glob(f"{output_dir}/**/*.sfs", recursive=True):
-                          run_cmd(f"unsquashfs -d {extracted_rootfs} {sqfs}")
+                          run_cmd(f"unsquashfs -d {extracted_rootfs} \"{sqfs}\"")
                           break
               except Exception as e:
                   print(f"[-] خطأ أثناء التفكيك: {e}")
