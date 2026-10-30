@@ -1,0 +1,160 @@
+
+name: Analyze Original K2P Firmware
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binwalk \
+            squashfs-tools \
+            file \
+            xz-utils \
+            gzip \
+            unzip
+
+      - name: Find original firmware
+        id: fw
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FW=$(find . -maxdepth 2 -type f \
+            -name 'METATRON-K2P*.bin' | head -n 1)
+
+          if [ -z "$FW" ]; then
+            echo "::error::Original firmware not found."
+            exit 1
+          fi
+
+          echo "fw_path=$FW" >> "$GITHUB_OUTPUT"
+          echo "Firmware found: $FW"
+
+      - name: Create report directory
+        run: mkdir -p report
+
+      - name: Analyze original firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FW="${{ steps.fw.outputs.fw_path }}"
+
+          file "$FW" > report/01-file-info.txt
+          sha256sum "$FW" > report/02-sha256.txt
+          stat "$FW" > report/03-firmware-size.txt
+          binwalk "$FW" > report/04-binwalk.txt
+          binwalk -E "$FW" > report/05-entropy.txt 2>&1 || true
+          strings -a "$FW" > report/06-strings.txt
+
+      - name: Extract SquashFS from the specified offset and validate size
+        id: squashfs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p report
+          FW="${{ steps.fw.outputs.fw_path }}"
+
+          if [ ! -f "$FW" ]; then
+            echo "::error::Original firmware not found."
+            exit 1
+          fi
+
+          dd if="$FW" of=report/original-rootfs.squashfs \
+            bs=1 skip=2853938 count=7970790 status=none
+
+          ACTUAL_SIZE=$(stat -c%s report/original-rootfs.squashfs)
+
+          if [ "$ACTUAL_SIZE" -ne 7970790 ]; then
+            echo "::error::SquashFS size mismatch: expected 7970790, got $ACTUAL_SIZE"
+            exit 1
+          fi
+
+          stat report/original-rootfs.squashfs \
+            > report/09-squashfs-size.txt
+
+          unsquashfs -s report/original-rootfs.squashfs \
+            > report/10-unsquashfs-info.txt 2>&1 || true
+
+          echo "squashfs_path=report/original-rootfs.squashfs" >> "$GITHUB_OUTPUT"
+
+      - name: Extract firmware filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p report/rootfs
+
+          unsquashfs -d report/rootfs \
+            report/original-rootfs.squashfs
+
+      - name: Collect system configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="report/rootfs"
+
+          find "$ROOT/etc" -maxdepth 3 -type f \
+            2>/dev/null | sort \
+            > report/11-etc-files.txt
+
+          for f in \
+            etc/openwrt_release \
+            etc/os-release \
+            etc/board.json \
+            etc/config/system \
+            etc/config/network \
+            etc/config/wireless \
+            etc/config/firewall \
+            etc/config/dhcp
+          do
+            if [ -f "$ROOT/$f" ]; then
+              {
+                echo
+                echo "========== $f =========="
+                cat "$ROOT/$f"
+              } >> report/12-system-config.txt
+            fi
+          done
+
+          if [ -f "$ROOT/usr/lib/opkg/status" ]; then
+            cp "$ROOT/usr/lib/opkg/status" \
+              report/13-installed-packages.txt
+          fi
+
+          find "$ROOT/lib/firmware" "$ROOT/lib/modules" \
+            -type f 2>/dev/null | sort \
+            > report/14-drivers-and-firmware.txt || true
+
+          find "$ROOT/etc" -type f \
+            \( -iname '*wifi*' -o -iname '*wireless*' -o -iname '*board*' \) \
+            2>/dev/null | sort \
+            > report/15-wireless-and-board-files.txt
+
+      - name: Create analysis archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf k2p-analysis-report.tar.gz report
+
+      - name: Upload analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: K2P-Firmware-Analysis
+          path: |
+            report/
+            k2p-analysis-report.tar.gz
+          if-no-files-found: error
+          retention-days: 7
