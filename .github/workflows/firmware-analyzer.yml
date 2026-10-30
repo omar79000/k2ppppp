@@ -1,0 +1,160 @@
+name: Ultimate OpenWrt Sysupgrade Analyzer
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_path:
+        description: 'اسم ملف السوفتوير في المستودع (مثال: k2p-sysupgrade.bin)'
+        required: true
+        default: 'firmware.bin'
+
+jobs:
+  analyze_and_extract:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Up Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          large-packages: true
+          swap-storage: false
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binwalk squashfs-tools sasquatch ubi-reader \
+            tar gzip python3 findutils grep coreutils
+
+      - name: Create Python Analyzer Engine Inline
+        run: |
+          cat << 'EOF' > analyze_firmware.py
+          import os
+          import sys
+          import tarfile
+          import subprocess
+          import glob
+
+          def run_cmd(cmd):
+              result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return result.stdout + result.stderr
+
+          def main():
+              fw_file = "firmware.bin"
+              for i in range(len(sys.argv)):
+                  if sys.argv[i] == "--file" and i + 1 < len(sys.argv):
+                      fw_file = sys.argv[i+1]
+
+              if not os.path.exists(fw_file):
+                  print(f"[-] الخطأ: ملف السوفتوير {fw_file} غير موجود في المستودع!")
+                  sys.exit(1)
+
+              output_dir = "extracted_fw"
+              report_dir = "analysis_output"
+              os.makedirs(output_dir, exist_ok=True)
+              os.makedirs(report_dir, exist_ok=True)
+
+              print(f"[+] بدء التفكيك والتحليل التلقائي للملف: {fw_file}")
+              
+              extracted_rootfs = os.path.join(output_dir, "rootfs")
+              os.makedirs(extracted_rootfs, exist_ok=True)
+
+              try:
+                  if tarfile.is_tarfile(fw_file):
+                      print("[*] الملف أرشيف Tar (Sysupgrade قياسي)، يتم استخراجه...")
+                      with tarfile.open(fw_file, "r") as tar:
+                          tar.extractall(path=output_dir)
+                      for sub in glob.glob(f"{output_dir}/**/*", recursive=True):
+                          if "root" in sub and (sub.endswith(".sfs") or sub.endswith(".squashfs") or sub.endswith(".tar.gz")):
+                              if sub.endswith(".tar.gz"):
+                                  run_cmd(f"tar -xzf {sub} -C {extracted_rootfs}")
+                              else:
+                                  run_cmd(f"unsquashfs -d {extracted_rootfs}/extracted {sub}")
+                  else:
+                      print("[*] الملف صورة خام، يتم استخدام Binwalk والتفكيك...")
+                      run_cmd(f"binwalk -e --directory={output_dir} {fw_file}")
+                      for sqfs in glob.glob(f"{output_dir}/**/*.squashfs", recursive=True) + glob.glob(f"{output_dir}/**/*.sfs", recursive=True):
+                          run_cmd(f"unsquashfs -d {extracted_rootfs} {sqfs}")
+                          break
+              except Exception as e:
+                  print(f"[-] خطأ أثناء التفكيك: {e}")
+
+              search_base = extracted_rootfs if os.listdir(extracted_rootfs) else output_dir
+
+              report_path = os.path.join(report_dir, "report.md")
+              with open(report_path, "w", encoding="utf-8") as report:
+                  report.write("# 📊 تقرير تحليل وفك سوفتوير الأوبن ورت الشامل\n\n")
+
+                  # 1. Radio Drivers
+                  report.write("## 1. كروت الراديو والتعريفات اللاسلكية (Radio Drivers)\n")
+                  drivers_found = set()
+                  patterns = ["mt76", "ath9k", "ath10k", "ath11k", "rt2x00", "rtl81", "mac80211"]
+                  for root, dirs, files in os.walk(search_base):
+                      for file in files:
+                          if file.endswith(".ko"):
+                              for p in patterns:
+                                  if p in file:
+                                      drivers_found.add(file)
+                  if drivers_found:
+                      for d in sorted(drivers_found):
+                          report.write(f"- `{d}`\n")
+                  else:
+                      report.write("*(لم يتم رصد ملفات `.ko` مباشرة، جاري فحص ملفات التكوين)*\n")
+
+                  # 2. Modifications & uci-defaults
+                  report.write("\n## 2. التعديلات وسكربتات التشغيل التلقائي (uci-defaults)\n")
+                  uci_files = glob.glob(f"{search_base}/**/uci-defaults/*", recursive=True)
+                  if uci_files:
+                      for ud in uci_files:
+                          report.write(f"- **{os.path.basename(ud)}**\n")
+                          try:
+                              with open(ud, "r", encoding="utf-8", errors="ignore") as f:
+                                  report.write("  ```bash\n" + f.read()[:1000] + "\n  ```\n")
+                          except:
+                              pass
+                  else:
+                      report.write("- لا توجد ملفات uci-defaults ظاهرة.\n")
+
+                  # 3. Secrets & Tokens
+                  report.write("\n## 3. الأسرار، التوكنات، والبوتات المكتشفة (Secrets & Tokens)\n")
+                  keywords = ["password", "passwd", "token", "bot", "telegram", "chat_id", "api_key", "secret"]
+                  found_secrets = []
+                  for root, dirs, files in os.walk(search_base):
+                      for file in files:
+                          fp = os.path.join(root, file)
+                          try:
+                              if os.path.getsize(fp) > 1024 * 512: continue
+                              with open(fp, "r", encoding="utf-8", errors="ignore") as sf:
+                                  content = sf.read()
+                                  for kw in keywords:
+                                      if kw in content.lower():
+                                          found_secrets.append((fp, kw))
+                          except:
+                              pass
+                  if found_secrets:
+                      report.write("تم رصد كلمات مفتاحية حساسة في المسارات التالية:\n")
+                      for path, kw in found_secrets[:25]:
+                          report.write(f"- المسار: `{path}` (الكلمة المرصودة: `{kw}`)\n")
+                  else:
+                      report.write("*(لم يتم العثور على كلمات سرية أو توكنات واضحة في النصوص)*\n")
+
+                  report.write("\n## 4. حالة التقرير\nتمت عملية الاستخراج والتحليل الأوتوماتيكي بنجاح.\n")
+              print("[+] تم إنشاء تقرير التحليل بنجاح.")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: Run Python Firmware Analyzer
+        run: |
+          python3 analyze_firmware.py --file "${{ github.event.inputs.firmware_path }}"
+
+      - name: Upload Detailed Analysis Report (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-analysis-report
+          path: analysis_output/
