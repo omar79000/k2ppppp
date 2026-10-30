@@ -23,12 +23,13 @@ jobs:
           large-packages: true
           swap-storage: false
 
-      - name: Install System Dependencies
+      - name: Install System Dependencies & Python Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            binwalk squashfs-tools sasquatch ubi-reader \
-            tar gzip python3 findutils grep coreutils
+            binwalk squashfs-tools \
+            tar gzip python3 python3-pip findutils grep coreutils
+          pip install ubi-reader
 
       - name: Create Python Analyzer Engine Inline
         run: |
